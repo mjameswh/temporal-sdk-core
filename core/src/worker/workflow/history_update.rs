@@ -127,7 +127,7 @@ impl HistoryPaginator {
         client: Arc<dyn WorkerClient>,
     ) -> Result<(Self, PreparedWFT), tonic::Status> {
         let empty_hist = wft.history.events.is_empty();
-        let npt = if empty_hist {
+        let npt: NextPageToken = if empty_hist {
             NextPageToken::FetchFromStart
         } else {
             wft.next_page_token.into()
@@ -244,7 +244,24 @@ impl HistoryPaginator {
     /// we have two, or until we are at the end of history.
     pub(crate) async fn extract_next_update(&mut self) -> Result<HistoryUpdate, tonic::Status> {
         loop {
-            let no_next_page = !self.get_next_page().await?;
+            let has_next_page = self.fetch_history_events().await?;
+
+            // If we fetched the last page and rthere are ""final events", its time to append those
+            if (!has_next_page && false) {
+                if matches!(&self.next_page_token, NextPageToken::Done) {
+                    // If finished, we need to extend the queue with the final events, skipping any
+                    // which are already present.
+                    if let Some(last_event_id) = self.event_queue.back().map(|e| e.event_id) {
+                        let final_events = mem::take(&mut self.final_events);
+                        self.event_queue.extend(
+                            final_events
+                                .into_iter()
+                                .skip_while(|e2| e2.event_id <= last_event_id),
+                        );
+                    }
+                };
+            }
+
             let current_events = mem::take(&mut self.event_queue);
             let seen_enough_events = current_events
                 .back()
@@ -268,7 +285,7 @@ impl HistoryPaginator {
                 .unwrap_or_default()
                 >= self.wft_started_event_id;
             if current_events.is_empty()
-                && no_next_page
+                && !has_next_page
                 && already_sent_update_with_enough_events
             {
                 // We must return an empty update which also says is contains the final WFT so we
@@ -282,7 +299,7 @@ impl HistoryPaginator {
                 .0);
             }
 
-            if current_events.is_empty() || (no_next_page && !seen_enough_events) {
+            if current_events.is_empty() || (!has_next_page && !seen_enough_events) {
                 // If next page fetching happened, and we still ended up with no or insufficient
                 // events, something is wrong. We're expecting there to be more events to be able to
                 // extract this update, but server isn't giving us any. We have no choice except to
@@ -295,7 +312,7 @@ impl HistoryPaginator {
             let first_event_id = current_events.front().unwrap().event_id;
             // We only *really* have the last WFT if the events go all the way up to at least the
             // WFT started event id. Otherwise we somehow still have partial history.
-            let no_more = matches!(self.next_page_token, NextPageToken::Done) && seen_enough_events;
+            let no_more = !has_next_page && seen_enough_events;
             let (update, extra) = HistoryUpdate::from_events(
                 current_events,
                 self.previous_wft_started_id,
@@ -321,14 +338,16 @@ impl HistoryPaginator {
 
     /// Fetches the next page and adds it to the internal queue.
     /// Returns true if we still have a next page token after fetching.
-    async fn get_next_page(&mut self) -> Result<bool, tonic::Status> {
-        let history = loop {
-            let npt = match mem::replace(&mut self.next_page_token, NextPageToken::Done) {
-                // If the last page token we got was empty, we're done.
-                NextPageToken::Done => break None,
-                NextPageToken::FetchFromStart => vec![],
-                NextPageToken::Next(v) => v,
-            };
+    pub async fn fetch_history_events(&mut self) -> Result<VecDeque<HistoryEvent>, tonic::Status> {
+        let events: VecDeque<HistoryEvent> = VecDeque::new();
+
+        let npt = match mem::replace(&mut self.next_page_token, NextPageToken::Done) {
+            NextPageToken::Done => return Ok(events),
+            NextPageToken::FetchFromStart => vec![],
+            NextPageToken::Next(v) => v,
+        };
+
+        loop {
             debug!(run_id=%self.run_id, "Fetching new history page");
             let fetch_res = self
                 .client
@@ -336,37 +355,13 @@ impl HistoryPaginator {
                 .instrument(span!(tracing::Level::TRACE, "fetch_history_in_paginator"))
                 .await?;
 
-            self.next_page_token = fetch_res.next_page_token.into();
+            npt = fetch_res.next_page_token.into();
 
-            let history_is_empty = fetch_res
-                .history
-                .as_ref()
-                .map(|h| h.events.is_empty())
-                .unwrap_or(true);
-            if history_is_empty && matches!(&self.next_page_token, NextPageToken::Next(_)) {
-                // If the fetch returned an empty history, but there *was* a next page token,
-                // immediately try to get that.
-                continue;
-            }
-            // Async doesn't love recursion so we do this instead.
-            break fetch_res.history;
+            events.extend(fetch_res.history.map(|h| h.events).unwrap_or_default());
         };
 
-        self.event_queue
-            .extend(history.map(|h| h.events).unwrap_or_default());
-        if matches!(&self.next_page_token, NextPageToken::Done) {
-            // If finished, we need to extend the queue with the final events, skipping any
-            // which are already present.
-            if let Some(last_event_id) = self.event_queue.back().map(|e| e.event_id) {
-                let final_events = mem::take(&mut self.final_events);
-                self.event_queue.extend(
-                    final_events
-                        .into_iter()
-                        .skip_while(|e2| e2.event_id <= last_event_id),
-                );
-            }
-        };
-        Ok(!matches!(&self.next_page_token, NextPageToken::Done))
+        self.next_page_token = NextPageToken::Done;
+        Ok(events)
     }
 }
 
@@ -401,7 +396,7 @@ impl Stream for StreamingHistoryPaginator {
             // SAFETY: This is safe because the inner paginator cannot be dropped before the future,
             //   and the future won't be moved from out of this struct.
             this.open_history_request.set(Some(unsafe {
-                transmute(HistoryPaginator::get_next_page(this.inner).boxed())
+                transmute(HistoryPaginator::fetch_history_events(this.inner).boxed())
             }));
         }
         let history_req = this.open_history_request.as_mut().as_pin_mut().unwrap();
