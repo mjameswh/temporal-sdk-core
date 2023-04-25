@@ -244,7 +244,7 @@ impl HistoryPaginator {
     /// we have two, or until we are at the end of history.
     pub(crate) async fn extract_next_update(&mut self) -> Result<HistoryUpdate, tonic::Status> {
         loop {
-            let fetch_happened = !self.get_next_page().await?;
+            let no_next_page = !self.get_next_page().await?;
             let current_events = mem::take(&mut self.event_queue);
             let seen_enough_events = current_events
                 .back()
@@ -268,7 +268,7 @@ impl HistoryPaginator {
                 .unwrap_or_default()
                 >= self.wft_started_event_id;
             if current_events.is_empty()
-                && !fetch_happened
+                && no_next_page
                 && already_sent_update_with_enough_events
             {
                 // We must return an empty update which also says is contains the final WFT so we
@@ -282,7 +282,7 @@ impl HistoryPaginator {
                 .0);
             }
 
-            if current_events.is_empty() || (fetch_happened && !seen_enough_events) {
+            if current_events.is_empty() || (no_next_page && !seen_enough_events) {
                 // If next page fetching happened, and we still ended up with no or insufficient
                 // events, something is wrong. We're expecting there to be more events to be able to
                 // extract this update, but server isn't giving us any. We have no choice except to
@@ -319,13 +319,13 @@ impl HistoryPaginator {
         }
     }
 
-    /// Fetches the next page and adds it to the internal queue. Returns true if a fetch was
-    /// performed, false if there is no next page.
+    /// Fetches the next page and adds it to the internal queue.
+    /// Returns true if we still have a next page token after fetching.
     async fn get_next_page(&mut self) -> Result<bool, tonic::Status> {
         let history = loop {
             let npt = match mem::replace(&mut self.next_page_token, NextPageToken::Done) {
                 // If the last page token we got was empty, we're done.
-                NextPageToken::Done => return Ok(false),
+                NextPageToken::Done => break None,
                 NextPageToken::FetchFromStart => vec![],
                 NextPageToken::Next(v) => v,
             };
@@ -366,7 +366,7 @@ impl HistoryPaginator {
                 );
             }
         };
-        Ok(true)
+        Ok(!matches!(&self.next_page_token, NextPageToken::Done))
     }
 }
 
